@@ -470,7 +470,51 @@ Distribute `ca.crt` to all client browsers and devices on the farm network so th
 
 ### 1.9 Network Diagram
 
-![On-premise deployment diagram](https://github.com/user-attachments/assets/bd192fd5-7765-4166-8e40-208c3c1443b6)
+```mermaid
+graph TD
+    subgraph sensors["Field IoT Sensors"]
+        S1[Soil Probe]
+        S2[Weather Station]
+        S3[Leaf Wetness Sensor]
+    end
+
+    subgraph onprem["On-Premise Host  (Air-Gapped Field Station)"]
+        MQTT[Mosquitto\nMQTT Broker :1883]
+        BE[Backend\nFastAPI :8000]
+        ML[ML Service\n:8080]
+        PG[(PostgreSQL\n+ TimescaleDB)]
+        NGINX[Nginx\n:80 / :443]
+        FE[Frontend\nDash :8050]
+
+        subgraph monitoring["Monitoring"]
+            PROM[Prometheus]
+            LOKI[Loki]
+            PT[Promtail]
+            GF[Grafana :3000]
+        end
+    end
+
+    subgraph clients["Farm Clients"]
+        AGR[Agronomist\nBrowser]
+    end
+
+    S1 -->|MQTT| MQTT
+    S2 -->|MQTT| MQTT
+    S3 -->|MQTT| MQTT
+    MQTT -->|sensor topics| BE
+    BE -->|inference request| ML
+    ML -->|prediction result| BE
+    BE <-->|read/write| PG
+    NGINX -->|proxy| FE
+    NGINX -->|proxy /api| BE
+    FE -->|REST| BE
+    AGR -->|HTTPS| NGINX
+    BE -->|metrics| PROM
+    ML -->|metrics| PROM
+    PT -->|scrape logs| LOKI
+    PROM -->|datasource| GF
+    LOKI -->|datasource| GF
+```
 
 ---
 
@@ -559,7 +603,55 @@ Rationale: for a skeleton team, the operational overhead of self-managing Promet
 
 ### 2.8 Architecture Diagram
 
-![Cloud deployment diagram](https://github.com/user-attachments/assets/2893ec17-4b4e-4d46-8c2d-ede93ffad9f2)
+```mermaid
+graph TD
+    subgraph internet["Internet"]
+        USER[AgriNusa\nAnalyst Browser]
+    end
+
+    subgraph aws["AWS  ap-southeast-1"]
+        R53[Route 53]
+        PALB[Public ALB]
+        IALB[Internal ALB]
+
+        subgraph vpc["VPC"]
+            subgraph public["Public Subnet"]
+                NAT[NAT Gateway]
+            end
+
+            subgraph private["Private Subnet"]
+                FE_ECS[Frontend\nECS Fargate]
+                BE_ECS[Backend\nECS Fargate]
+                ML_ECS[ML Service\nECS Fargate]
+                RDS[(RDS PostgreSQL\nMulti-AZ)]
+            end
+        end
+
+        ECR[ECR\nImage Registry]
+        SM[Secrets Manager]
+        CW[CloudWatch\nLogs & Metrics]
+    end
+
+    subgraph corvian["Corvian Account"]
+        CECR[Corvian ECR\nSource Registry]
+    end
+
+    USER --> R53 --> PALB --> FE_ECS
+    FE_ECS --> IALB --> BE_ECS
+    BE_ECS --> ML_ECS
+    BE_ECS --> RDS
+    FE_ECS -.->|pull image| ECR
+    BE_ECS -.->|pull image| ECR
+    ML_ECS -.->|pull image| ECR
+    CECR -.->|ECR replication| ECR
+    SM -.->|secrets injection| BE_ECS
+    SM -.->|secrets injection| FE_ECS
+    FE_ECS -->|logs & metrics| CW
+    BE_ECS -->|logs & metrics| CW
+    ML_ECS -->|logs & metrics| CW
+    RDS -->|metrics| CW
+    private -->|outbound| NAT
+```
 
 ---
 
@@ -683,11 +775,67 @@ Run a local DNS resolver — dnsmasq or CoreDNS deployed as a container — that
 
 ### 3.6 Architecture Diagram
 
-![Hybrid deployment diagram](https://github.com/user-attachments/assets/3641a612-962d-4769-8820-8829d181eae6)
+```mermaid
+graph TD
+    subgraph onprem["AgriNusa Estate Office  (On-Premise)"]
+        SENSORS[IoT Sensors]
+        MQTT[Mosquitto MQTT]
+        BE_OP[Backend FastAPI]
+        ML_OP[ML Service]
+        PG_OP[(PostgreSQL\n+ TimescaleDB)]
+        FE_OP[Frontend + Nginx]
+        WG[WireGuard VPN]
+        SM_OP[sync-monitor]
+        DNS_L[Local DNS\ndnsmasq/CoreDNS]
+    end
 
-### 3.7 Hybrid DNS Failover Diagram
+    subgraph aws["AWS  ap-southeast-1"]
+        PALB[Public ALB]
+        IALB[Internal ALB]
+        FE_C[Frontend ECS]
+        BE_C[Backend ECS]
+        ML_C[ML Service ECS]
+        RDS[(RDS PostgreSQL)]
+        WG_C[WireGuard Peer\nEC2]
+        R53[Route 53\nFailover Routing]
+    end
 
-![Hybrid DNS failover](https://github.com/user-attachments/assets/0e08ddfa-1955-45ca-8b05-078acffe7e79)
+    subgraph clients["Estate Office Clients"]
+        AGR[Agronomist Browser]
+    end
+
+    SENSORS -->|MQTT :1883| MQTT --> BE_OP --> ML_OP
+    BE_OP <--> PG_OP
+    BE_OP --> FE_OP
+    AGR -->|primary| DNS_L -->|resolves local IP| FE_OP
+
+    WG <-->|IPsec / WireGuard tunnel| WG_C
+    PG_OP <-->|pglogical WAL replication| RDS
+
+    SM_OP -->|monitors| WG
+    SM_OP -->|pg_stat_replication| PG_OP
+
+    R53 -->|PRIMARY: on-premise healthy| FE_OP
+    R53 -->|SECONDARY: failover| PALB --> FE_C --> IALB --> BE_C --> ML_C
+    BE_C --> RDS
+    AGR -->|failover| R53
+```
+
+### 3.7 DNS Failover Diagram
+
+```mermaid
+flowchart TD
+    AGR([Agronomist Browser])
+
+    AGR -->|DNS query:\nfieldops.agrinusa.corvian.io| Q{Internet\navailable?}
+
+    Q -->|Yes| R53[Route 53]
+    R53 -->|Health check PASS\nPRIMARY| OP[On-Premise\nEstate Server]
+    R53 -->|Health check FAIL\nFAILOVER| ALB[AWS Public ALB\nap-southeast-1]
+
+    Q -->|No| LDNS[Local DNS Resolver\ndnsmasq / CoreDNS]
+    LDNS -->|Always resolves to\nlocal IP| OP
+```
 
 ---
 

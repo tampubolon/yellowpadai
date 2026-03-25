@@ -1,0 +1,22 @@
+# k3d cluster config for YellowPad local deployment
+# - flannel disabled so Cilium can be installed as the CNI
+# - traefik disabled (Cilium Ingress replaces it)
+# - servicelb disabled (Cilium LB IPAM replaces it)
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: yellowpad
+servers: 1
+agents: 1
+options:
+  k3s:
+    extraArgs:
+      - arg: --flannel-backend=none
+        nodeFilters:
+          - server:*
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+      - arg: --disable=servicelb
+        nodeFilters:
+          - server:*

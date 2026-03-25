@@ -13,13 +13,16 @@ This guide is written for your IT team. It walks you through deploying YellowPad
 ### Software
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Docker | 24+ | Build images, run kind nodes |
-| kind | 0.22+ | Local Kubernetes cluster |
+| Docker | 24+ | Build images, run k3d nodes |
+| k3d | 5.6+ | Local Kubernetes cluster (k3s in Docker) |
 | kubectl | 1.29+ | Cluster management |
 | Helm | 3.14+ | Install Cilium CNI |
 | make | any | Convenience commands (optional) |
 
-Install kind: `go install sigs.k8s.io/kind@latest` or download from https://kind.sigs.k8s.io/docs/user/quick-start/#installation
+Install k3d:
+```bash
+curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+```
 
 ### Access
 - Internet access to pull images on first run (docker.io, quay.io)
@@ -32,12 +35,12 @@ Install kind: `go install sigs.k8s.io/kind@latest` or download from https://kind
 ### 1. Create the cluster
 
 ```bash
-kind create cluster --name yellowpad --config kind-config.yaml
+k3d cluster create --config k3d-config.yaml
 ```
 
-This creates a 2-node kind cluster (1 control-plane + 1 worker) with the default CNI disabled, ready for Cilium.
+This creates a 2-node k3d cluster (1 server + 1 agent) with flannel, Traefik, and the built-in service LB all disabled — ready for Cilium to take over.
 
-Verify: `kubectl get nodes` — both nodes should show `Ready` within ~60 seconds.
+Verify: `kubectl get nodes` — both nodes should show `Ready` within ~30 seconds.
 
 ### 2. Install Cilium (CNI + Ingress controller)
 
@@ -74,14 +77,14 @@ If unsure, ask your network admin for a small block of unused IPs on the same su
 
 ```bash
 # Build
-docker build -t yellowpad/api-gateway:latest       ./src/api-gateway
+docker build -t yellowpad/api-gateway:latest        ./src/api-gateway
 docker build -t yellowpad/document-processor:latest ./src/document-processor
-docker build -t yellowpad/web-ui:latest             ./src/web-ui
+docker build -t yellowpad/web-ui:latest              ./src/web-ui
 
-# Load into the kind cluster (no registry needed)
-kind load docker-image yellowpad/api-gateway:latest        --name yellowpad
-kind load docker-image yellowpad/document-processor:latest --name yellowpad
-kind load docker-image yellowpad/web-ui:latest             --name yellowpad
+# Import directly into the k3d cluster (no registry needed)
+k3d image import yellowpad/api-gateway:latest        --cluster yellowpad
+k3d image import yellowpad/document-processor:latest --cluster yellowpad
+k3d image import yellowpad/web-ui:latest             --cluster yellowpad
 ```
 
 Or with make: `make build load`
@@ -128,7 +131,7 @@ Run these checks after deployment to confirm everything is healthy.
 ### All pods running
 ```bash
 kubectl get pods -n yellowpad
-# Expected: all pods STATUS=Running, READY=1/1 (or 1/1 for each container)
+# Expected: all pods STATUS=Running, READY=1/1
 ```
 
 ### API health check
@@ -204,7 +207,7 @@ curl -X POST http://localhost:8001/process/1
 kubectl describe pod <pod-name> -n yellowpad  # look at Events section
 kubectl get pvc -n yellowpad                  # check PVC status
 ```
-For kind, the default StorageClass (`standard`) uses host paths and provisions automatically. If PVCs are stuck in `Pending`, ensure the kind cluster is running: `kind get clusters`.
+k3d uses the local-path provisioner by default, which provisions PVCs automatically from the host filesystem. If PVCs are stuck, confirm the cluster is healthy: `k3d cluster list`.
 
 ---
 
@@ -214,10 +217,10 @@ For kind, the default StorageClass (`standard`) uses host paths and provisions a
 
 **Cause:** `/healthz` returns 503 when PostgreSQL, Redis, or MinIO isn't ready yet. This is expected during startup.
 
-**Fix:** Wait 1–2 minutes for all backing services to become healthy. PostgreSQL takes longest. Check:
+**Fix:** Wait 1–2 minutes for all backing services to become healthy. Check:
 ```bash
 kubectl logs -n yellowpad deploy/api-gateway
-kubectl get pods -n yellowpad  # postgres-0 and redis/minio must be Running first
+kubectl get pods -n yellowpad  # postgres-0, redis, and minio must be Running first
 ```
 
 ---
@@ -230,7 +233,8 @@ kubectl get pods -n yellowpad  # postgres-0 and redis/minio must be Running firs
 
 **Fix:** Re-check the IP assigned by Cilium:
 ```bash
-kubectl -n kube-system get svc cilium-ingress-yellowpad-yellowpad-ingress -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+kubectl -n kube-system get svc cilium-ingress-yellowpad-yellowpad-ingress \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
 ```
 Update `/etc/hosts` with the correct IP.
 

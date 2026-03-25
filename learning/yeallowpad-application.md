@@ -114,6 +114,317 @@ Status enums (`draft`, `active`, `archived`) and soft deletes (`deleted_at`) giv
 
 ---
 
+## How the Platform Works Under the Hood
+
+### Request Lifecycle — Happy Path
+
+Every authenticated API call traverses the same middleware stack before reaching business logic:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  CLIENT (web app / mobile)                                              │
+│  POST /v1/business/sales/sell-rate-cards                                │
+│  Authorization: Bearer <cognito_jwt>                                    │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ HTTPS (TLS 1.2+)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ALB (Application Load Balancer)                                        │
+│  • Terminates TLS — services never see raw certs                        │
+│  • WAF evaluates request (SQLi, XSS, rate limit, geo rules)             │
+│  • Path-based routing: /v1/business/* → BLS target group (port 4000)    │
+│  • Health check gate: routes only to healthy ECS tasks                  │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ HTTP (private subnet)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ECS FARGATE TASK — Business Logic Service                              │
+│  (Uvicorn → FastAPI ASGI app)                                           │
+│                                                                         │
+│  Middleware stack (applied in order):                                   │
+│  1. CORSMiddleware        — validates Origin, injects CORS headers      │
+│  2. ContextMiddleware     — attaches X-Request-ID to request state      │
+│  3. AuthenticationMiddleware (compass-auth)                             │
+│     ├── Skips: OPTIONS, /health, /docs                                  │
+│     ├── Extracts Bearer token from Authorization header                 │
+│     ├── JwtAuthStrategy → RS256 decode against Cognito JWKS endpoint   │
+│     ├── Maps JWT claims → AuthenticatedUser(id, role, email, ...)      │
+│     ├── Stores AuthenticatedUser in request.state.context               │
+│     └── Appends X-Request-ID to response headers                       │
+│  4. StructLogMiddleware   — logs method, path, status, latency (JSON)  │
+│                                                                         │
+│  FastAPI router dispatches to endpoint function                         │
+│  Dependency injection:                                                  │
+│  • TenantUser   — reads from request.state.context (already validated) │
+│  • AsyncSession — opens SQLAlchemy async session from pool              │
+│  • ServiceDep   — instantiates service class with session injected      │
+│                                                                         │
+│  Endpoint calls service → service calls repository → SQLAlchemy ORM    │
+│  → asyncpg executes SQL against Aurora PostgreSQL                       │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 │ asyncpg (PostgreSQL wire protocol)
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  AURORA POSTGRESQL (private subnet, tier 3)                             │
+│  • Serverless v2 — scales ACUs on demand, auto-pauses when idle         │
+│  • SQLAlchemy ORM maps Python models ↔ tables                           │
+│  • Alembic manages schema versions                                      │
+│  • Soft deletes: deleted_at timestamp, never hard-deleted via API       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Authentication Deep Dive
+
+The `compass-auth` library implements a **pluggable strategy pattern** so the same middleware works in all environments without code changes:
+
+```
+                    AuthenticationMiddleware
+                           │
+                    CompositeStrategy
+                    ┌──────┴───────┐
+                    │              │
+              JwtStrategy    MockStrategy
+                    │              │
+              JwtAuthenticator   (dev/test only)
+              ┌─────┴──────┐
+              │            │
+          RS256Decoder  HS256Decoder
+          (production)   (local dev)
+```
+
+**Production flow (RS256):**
+1. Client sends `Authorization: Bearer <token>` obtained from Cognito login
+2. Middleware calls `JwtAuthStrategy.authenticate(request)`
+3. RS256Decoder fetches Cognito's JWKS public keys (cached), verifies signature, validates `exp`/`iss`/`aud` claims
+4. Claims mapped to `AuthenticatedUser(id, cognito_username, email, role, token_age_seconds, request_id)`
+5. User stored in `request.state.context` — downstream dependencies read it without touching the token again
+6. On failure: `AuthError` → 401 JSON response with `X-Request-ID` for correlation
+
+**Local dev flow (HS256):** Mock strategy bypasses Cognito entirely, accepts a pre-shared secret token — no network dependency during development.
+
+---
+
+### S3 File Upload Flow
+
+Rate card Excel files are uploaded directly from the browser to S3, bypassing the API tier for the binary transfer:
+
+```
+Browser                   Business Logic Service          S3
+   │                              │                        │
+   │  POST /upload-url            │                        │
+   │  { filename, content_type }  │                        │
+   │─────────────────────────────▶│                        │
+   │                              │ generate_presigned_url │
+   │                              │ key: uploads/temp/     │
+   │                              │   {user_id}/{uuid}/    │
+   │                              │   {filename}           │
+   │                              │───────────────────────▶│
+   │                              │◀───────────────────────│
+   │◀─────────────────────────────│                        │
+   │  { upload_url, s3_key }      │                        │
+   │                              │                        │
+   │  PUT {upload_url}            │                        │
+   │  [binary file content]       │                        │
+   │─────────────────────────────────────────────────────▶│
+   │◀─────────────────────────────────────────────────────│
+   │  200 OK                      │                        │
+   │                              │                        │
+   │  POST /rate-cards/           │                        │
+   │    batch-process-from-s3     │                        │
+   │  { s3_key }                  │                        │
+   │─────────────────────────────▶│                        │
+   │                              │ GetObject(s3_key)      │
+   │                              │───────────────────────▶│
+   │                              │◀───────────────────────│
+   │                              │ parse Excel → DB rows  │
+   │◀─────────────────────────────│                        │
+   │  { processed, skipped }      │                        │
+```
+
+The presigned URL expires after 15 minutes. The S3 key includes the user ID (`uploads/temp/{user_id}/{uuid}/{filename}`) — the backend validates ownership by checking the key prefix against the authenticated user before processing.
+
+---
+
+### AI Agent Flow (MA Layer)
+
+The MA Layer service is built around a **compiled LangGraph state machine** that runs as a streaming HTTP endpoint:
+
+```
+Client                     MA Layer Service                    PostgreSQL
+  │                              │                                  │
+  │  POST /chat/stream-response  │                                  │
+  │  { user_input, conv_id }     │                                  │
+  │  (SSE, keep-alive)           │                                  │
+  │─────────────────────────────▶│                                  │
+  │                              │ validate_conversation_id()       │
+  │                              │ SELECT conversation WHERE        │
+  │                              │   id=conv_id AND user_id=me      │
+  │                              │─────────────────────────────────▶│
+  │                              │◀─────────────────────────────────│
+  │                              │                                  │
+  │                              │ _resolve_input()                 │
+  │                              │ aget_state(thread_id=conv_id)    │
+  │                              │ ← reads last checkpoint          │
+  │                              │─────────────────────────────────▶│
+  │                              │◀─────────────────────────────────│
+  │                              │                                  │
+  │                              │ graph.astream_events(input_data) │
+  │                              │                                  │
+  │                              │ ┌────────────────────────────┐   │
+  │                              │ │  LangGraph State Machine   │   │
+  │                              │ │                            │   │
+  │                              │ │  user_input_node           │   │
+  │                              │ │       ↓                    │   │
+  │                              │ │  executor_node             │   │
+  │                              │ │  (selects next agent)      │   │
+  │                              │ │       ↓                    │   │
+  │                              │ │  [subgraph: extraction /   │   │
+  │                              │ │   validation / chat]       │   │
+  │                              │ │       ↓                    │   │
+  │                              │ │  LLM call (streaming)      │   │
+  │                              │ └────────────────────────────┘   │
+  │                              │                                  │
+  │  ← SSE chunk (text)          │ on_chat_model_stream event       │
+  │  ← SSE chunk (text)          │ yield JSON: {"type":"text",      │
+  │  ← SSE chunk (text)          │   "content": "..."}              │
+  │                              │                                  │
+  │                              │ checkpoint saved after each node │
+  │                              │─────────────────────────────────▶│
+  │                              │  checkpoints / checkpoint_blobs  │
+  │                              │  / checkpoint_writes tables      │
+  │                              │                                  │
+  │  [stream ends]               │ update_conversation_timestamp()  │
+  │                              │─────────────────────────────────▶│
+```
+
+**Key design decisions visible in the code:**
+
+- `_resolve_input()` checks `state.next` — if the graph is paused at a human-input interrupt node, the next message resumes it (`human_response`) instead of starting a new turn (`question`). This enables **multi-turn interruption** — the agent can ask a clarifying question and wait.
+- On `asyncio.CancelledError` (client disconnect): the partial response is saved to the checkpoint with a cancellation note, so the conversation history stays coherent even for aborted streams.
+- On `GraphRecursionError`: the agent hit its recursion limit (25 steps) — the graph state is reset and an intelligible message is streamed to the client rather than surfacing a raw exception.
+- Checkpoints use `AsyncPostgresSaver` — the same PostgreSQL database stores both business data and full agent state (messages, current plan, next agent). Deleting a conversation explicitly cleans `checkpoints`, `checkpoint_blobs`, and `checkpoint_writes` tables in order (FK-aware).
+
+---
+
+### Service-to-Service Communication
+
+Services call each other over the **Cloud Map private DNS namespace** — no public network hop:
+
+```
+Business Logic Service (ECS task)
+         │
+         │  httpx async HTTP client
+         │  http://wayfindr-compass-integration
+         │      .wayfindr-compass-{env}.local:5001
+         │
+         ▼
+Integration Service (ECS task, same VPC)
+         │
+         │  httpx with retry + exponential backoff
+         │  (external network only for this hop)
+         ▼
+    External API (HubSpot, Slack, etc.)
+```
+
+The `integration_service_client.py` in BLS and `business_logic_client.py` in MA Layer are thin typed HTTP clients — the service URLs are injected via environment variables resolved from Cloud Map DNS at deploy time.
+
+M2M authentication between services uses Cognito OAuth2 client credentials — each service has its own app client. Secrets are rotated via `update-m2m-secrets.sh` and stored in Secrets Manager.
+
+---
+
+### Database Session Lifecycle
+
+Each HTTP request gets its own isolated async database session:
+
+```python
+# compass-db library — simplified
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    async with session_factory() as session:
+        try:
+            yield session          # endpoint runs here
+            await session.commit() # auto-commit on success
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+```
+
+SQLAlchemy's async connection pool (asyncpg) maintains a pool of persistent connections to Aurora — individual requests don't pay the TCP handshake cost. Aurora Serverless v2 scales the compute layer transparently; the pool sees it as a stable host.
+
+---
+
+### Logging & Observability Pipeline
+
+Every log line is structured JSON in production, correlated by `X-Request-ID`:
+
+```
+Request enters
+     │
+     ▼
+ContextMiddleware assigns X-Request-ID (from header or generated UUID)
+     │
+     ▼
+AuthenticationMiddleware logs auth_success / auth_failure
+  { user_id, user_role, request_id, path, method, token_age_seconds }
+     │
+     ▼
+Endpoint logs domain events
+  { user_id, rate_card_id, action, ... }
+     │
+     ▼
+StructLogMiddleware logs request completion
+  { method, path, status_code, duration_ms, request_id }
+     │
+     ▼
+Uvicorn → stdout
+     │
+     ▼
+CloudWatch Container Logs
+  /aws/ecs/wayfindr-compass/{env}/{service_name}
+     │
+     ▼
+CloudWatch Insights query across all services by request_id
+```
+
+This means a single `X-Request-ID` can be traced across BLS → Integration → MA Layer logs in CloudWatch Insights — full distributed trace without a dedicated tracing backend.
+
+---
+
+### Deployment Flow (End to End)
+
+```
+Developer machine
+     │
+     ├─ make docker-build       ← multi-stage build (builder + runtime stages)
+     │    └─ copies shared lib wheels → installs deps → lean runtime image
+     │
+     ├─ make release-prod-image
+     │    ├─ docker build
+     │    ├─ aws ecr get-login-password | docker login
+     │    └─ docker push → ECR (wayfindr-compass repo)
+     │
+     └─ make deploy-production
+          └─ terraform apply (infra/envs/production/)
+               ├─ ECS task definition updated (new image digest)
+               ├─ ECS service triggers rolling deployment
+               │    ├─ new task started → health check passes
+               │    └─ old task drained + stopped
+               └─ ALB target group updated automatically
+
+     [separate terminal]
+     make bastion TARGET=db ENV=production
+          └─ SSM port-forward bastion → Aurora :5432 → localhost:5432
+               └─ make db-upgrade-production
+                    └─ alembic upgrade head (via tunnel)
+```
+
+Rolling deployment is zero-downtime: ECS registers the new task in the ALB target group only after the health check (`GET /health`) returns 2xx, then deregisters the old task gracefully.
+
+---
+
 ## Required Skills — Direct Evidence
 
 ### Infrastructure as Code (Terraform)

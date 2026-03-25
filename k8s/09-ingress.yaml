@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: yellowpad-ingress
+  namespace: yellowpad
+  annotations:
+    # Cilium Ingress controller handles routing natively — no rewrite annotation needed
+spec:
+  ingressClassName: cilium
+  rules:
+    - host: yellowpad.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web-ui
+                port:
+                  number: 80

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yellowpad-config
+  namespace: yellowpad
+data:
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: yellowpad
+  DB_USER: yellowpad
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_BUCKET: documents
+  DOCUMENT_PROCESSOR_URL: http://document-processor:8001

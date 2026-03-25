@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YellowPad - Document Intelligence</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8f9fa; color: #333; }
+        .header { background: #1a1a2e; color: white; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+        .header h1 { font-size: 1.5rem; font-weight: 600; }
+        .logo { width: 32px; height: 32px; background: #f4d03f; border-radius: 6px; }
+        .container { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+        .card { background: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .card h2 { font-size: 1.1rem; margin-bottom: 0.75rem; }
+        .status { display: flex; gap: 1rem; flex-wrap: wrap; }
+        .status-item { flex: 1; min-width: 150px; padding: 1rem; border-radius: 6px; text-align: center; }
+        .status-item.ok { background: #d4edda; color: #155724; }
+        .status-item.err { background: #f8d7da; color: #721c24; }
+        .status-item.loading { background: #e2e3e5; color: #383d41; }
+        .status-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; }
+        .status-value { font-size: 1.2rem; font-weight: 600; margin-top: 0.25rem; }
+        #upload-form { display: flex; gap: 0.5rem; }
+        #upload-form input { flex: 1; padding: 0.5rem; border: 1px solid #ddd; border-radius: 4px; }
+        #upload-form button { padding: 0.5rem 1.5rem; background: #f4d03f; border: none; border-radius: 4px; font-weight: 600; cursor: pointer; }
+        #result { margin-top: 1rem; padding: 0.75rem; border-radius: 4px; display: none; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="logo"></div>
+        <h1>YellowPad</h1>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h2>System Health</h2>
+            <div class="status" id="health-status">
+                <div class="status-item loading"><div class="status-label">API</div><div class="status-value">...</div></div>
+                <div class="status-item loading"><div class="status-label">Database</div><div class="status-value">...</div></div>
+                <div class="status-item loading"><div class="status-label">Redis</div><div class="status-value">...</div></div>
+                <div class="status-item loading"><div class="status-label">MinIO</div><div class="status-value">...</div></div>
+            </div>
+        </div>
+        <div class="card">
+            <h2>Upload Document</h2>
+            <form id="upload-form">
+                <input type="text" id="filename" placeholder="document.pdf" required>
+                <button type="submit">Upload</button>
+            </form>
+            <div id="result"></div>
+        </div>
+    </div>
+    <script>
+        const API = window.location.origin + '/api';
+
+        async function checkHealth() {
+            const container = document.getElementById('health-status');
+            try {
+                const res = await fetch(API + '/healthz');
+                const data = await res.json();
+                if (!res.ok && data.detail) Object.assign(data, data.detail);
+                container.innerHTML = Object.entries(data).map(([k, v]) => {
+                    const ok = v === 'ok';
+                    return `<div class="status-item ${ok ? 'ok' : 'err'}">
+                        <div class="status-label">${k}</div>
+                        <div class="status-value">${ok ? 'Healthy' : 'Down'}</div>
+                    </div>`;
+                }).join('');
+            } catch {
+                container.innerHTML = `<div class="status-item err"><div class="status-label">API</div><div class="status-value">Unreachable</div></div>`;
+            }
+        }
+
+        document.getElementById('upload-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const result = document.getElementById('result');
+            const filename = document.getElementById('filename').value;
+            try {
+                const res = await fetch(API + '/documents', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({filename, content: 'sample content for ' + filename}),
+                });
+                const data = await res.json();
+                result.style.display = 'block';
+                result.style.background = res.ok ? '#d4edda' : '#f8d7da';
+                result.textContent = res.ok ? `Uploaded: ID ${data.id}, status: ${data.status}` : `Error: ${JSON.stringify(data)}`;
+            } catch (err) {
+                result.style.display = 'block';
+                result.style.background = '#f8d7da';
+                result.textContent = 'Failed to connect to API';
+            }
+        });
+
+        checkHealth();
+        setInterval(checkHealth, 15000);
+    </script>
+</body>
+</html>

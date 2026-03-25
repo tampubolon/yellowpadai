@@ -1,4 +1,4 @@
-.PHONY: cluster cilium build deploy verify clean port-forward
+.PHONY: cluster cilium build load deploy verify clean port-forward port-forward-api all
 
 CLUSTER_NAME   := yellowpad
 REGISTRY       := yellowpad
@@ -7,7 +7,7 @@ CILIUM_VERSION := 1.16.5
 # ── Cluster setup ─────────────────────────────────────────────────────────────
 
 cluster:
-	kind create cluster --name $(CLUSTER_NAME) --config kind-config.yaml
+	k3d cluster create --config k3d-config.yaml
 	@echo "Waiting for cluster to be ready..."
 	kubectl wait --for=condition=Ready node --all --timeout=120s
 
@@ -28,14 +28,14 @@ setup: cluster cilium  ## Create cluster and install Cilium CNI
 # ── Build images ──────────────────────────────────────────────────────────────
 
 build:
-	docker build -t $(REGISTRY)/api-gateway:latest       ./src/api-gateway
+	docker build -t $(REGISTRY)/api-gateway:latest        ./src/api-gateway
 	docker build -t $(REGISTRY)/document-processor:latest ./src/document-processor
-	docker build -t $(REGISTRY)/web-ui:latest             ./src/web-ui
+	docker build -t $(REGISTRY)/web-ui:latest              ./src/web-ui
 
-load:  ## Load images into kind cluster (no registry needed)
-	kind load docker-image $(REGISTRY)/api-gateway:latest       --name $(CLUSTER_NAME)
-	kind load docker-image $(REGISTRY)/document-processor:latest --name $(CLUSTER_NAME)
-	kind load docker-image $(REGISTRY)/web-ui:latest             --name $(CLUSTER_NAME)
+load:  ## Import images into k3d cluster (no registry needed)
+	k3d image import $(REGISTRY)/api-gateway:latest        --cluster $(CLUSTER_NAME)
+	k3d image import $(REGISTRY)/document-processor:latest --cluster $(CLUSTER_NAME)
+	k3d image import $(REGISTRY)/web-ui:latest             --cluster $(CLUSTER_NAME)
 
 # ── Deploy ────────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ port-forward-api:  ## Forward api-gateway to http://localhost:8000
 # ── Teardown ──────────────────────────────────────────────────────────────────
 
 clean:
-	kind delete cluster --name $(CLUSTER_NAME)
+	k3d cluster delete $(CLUSTER_NAME)
 
 # ── All-in-one ────────────────────────────────────────────────────────────────
 

@@ -1,0 +1,19 @@
+# Cilium LB IPAM — assigns local IPs to LoadBalancer services without a cloud provider.
+# Cilium's Ingress controller creates a Service of type LoadBalancer automatically;
+# this pool gives it an IP reachable on your local network.
+#
+# !! Update the CIDR to a free range on your local network !!
+# Example: if your nodes are on 192.168.1.0/24, use something like 192.168.1.200/29
+#
+# After applying, check the assigned IP with:
+#   kubectl -n kube-system get svc cilium-ingress
+apiVersion: "cilium.io/v2alpha1"
+kind: CiliumLoadBalancerIPPool
+metadata:
+  name: yellowpad-local-pool
+spec:
+  blocks:
+    - cidr: "192.168.1.200/29"   # <-- change to a free range on your local network
+  serviceSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: cilium

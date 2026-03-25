@@ -1,0 +1,161 @@
+# NetworkPolicies enforced by Cilium
+# Default posture: deny all ingress to each pod, then add explicit allow rules.
+# Cilium enforces standard Kubernetes NetworkPolicy natively (no extra CRDs needed).
+# For L7 HTTP policies (e.g. allow only GET /healthz), use CiliumNetworkPolicy CRDs instead.
+
+# ── Default deny all ingress within the namespace ───────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: yellowpad
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+
+---
+# ── postgres: accept only from api-gateway and document-processor ────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres
+  namespace: yellowpad
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+        - podSelector:
+            matchLabels:
+              app: document-processor
+      ports:
+        - protocol: TCP
+          port: 5432
+
+---
+# ── redis: accept only from api-gateway and document-processor ───────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis
+  namespace: yellowpad
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+        - podSelector:
+            matchLabels:
+              app: document-processor
+      ports:
+        - protocol: TCP
+          port: 6379
+
+---
+# ── minio: accept from api-gateway and document-processor ────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-minio
+  namespace: yellowpad
+spec:
+  podSelector:
+    matchLabels:
+      app: minio
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+        - podSelector:
+            matchLabels:
+              app: document-processor
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9001
+
+---
+# ── api-gateway: accept from web-ui on port 8000 ─────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-gateway
+  namespace: yellowpad
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web-ui
+      ports:
+        - protocol: TCP
+          port: 8000
+
+---
+# ── document-processor: accept from api-gateway on port 8001 ─────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-document-processor
+  namespace: yellowpad
+spec:
+  podSelector:
+    matchLabels:
+      app: document-processor
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8001
+
+---
+# ── web-ui: accept from Cilium ingress controller (runs in kube-system) ───────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-ui
+  namespace: yellowpad
+spec:
+  podSelector:
+    matchLabels:
+      app: web-ui
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cilium-envoy
+      ports:
+        - protocol: TCP
+          port: 80

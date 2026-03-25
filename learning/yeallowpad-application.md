@@ -1,0 +1,233 @@
+# YellowPad Senior DevOps Engineer — Relevant Experience from Compass PaaS
+
+This document maps my hands-on work building the **Compass PaaS platform** to the requirements in YellowPad's Senior DevOps Engineer job description.
+
+---
+
+## What I Built: Compass PaaS
+
+Compass PaaS is a multi-tenant, cloud-native SaaS platform for logistics rate card management, built from the ground up on AWS. The system consists of:
+
+- **3 FastAPI microservices** (`business-logic-service`, `integration-service`, `ma-layer-service`)
+- **5 shared Python libraries** (auth, aws, core, db, logger) distributed as internal wheels
+- **Full Terraform IaC** provisioning 20+ AWS resources across 3-tier VPC architecture
+- **AI/LLM agent layer** (LangGraph + multi-agent orchestration with PostgreSQL checkpointing)
+- **External integrations** (HubSpot, Monday.com, Zendesk, Slack, Google Drive)
+
+---
+
+## Required Skills — Direct Evidence
+
+### Infrastructure as Code (Terraform)
+Terraform is the backbone of the entire platform. I authored a **modular, multi-environment Terraform codebase** from scratch:
+
+```
+infra/
+├── envs/           # staging, production, shared, setup
+│   ├── shared/     # VPC, Aurora, ECR, Bastion, Cognito
+│   ├── staging/    # ECS services + ALB (staging stack)
+│   └── production/ # ECS services + ALB (production stack)
+└── modules/
+    ├── tier1/      # alb, waf, monitoring
+    ├── tier2/      # ecs_cluster, ecs_service, bastion
+    ├── tier3/      # rds_aurora_cluster, s3, postgresql
+    ├── network/    # VPC, subnets, security groups, flow logs
+    ├── authentication/   # Cognito user pool + app clients
+    ├── certificates/     # ACM + DNS validation
+    ├── dns/              # Route53 hosted zone
+    └── shared/           # ecr, secrets_manager, ssm_parameters, ses
+```
+
+Key patterns used: `count`-based conditional resource creation, `locals` for computed values, cross-module output references, remote state via S3 + DynamoDB locking, 32-character AWS naming constraints handled via `substr()`.
+
+### Containerization & Multi-Stage Docker Builds
+All 3 services use an optimized **multi-stage build pattern**:
+
+- **Stage 1 (Builder):** `python:3.13-slim` — installs gcc/libpq-dev, builds shared library wheels, installs service deps to `/install` prefix
+- **Stage 2 (Runtime):** `python:3.13-slim` — copies only `/install` from builder, no build tools in final image
+
+Result: lean production images with no build toolchain artifacts. Business Logic Service additionally installs WeasyPrint system deps (PDF generation) in a targeted, minimal way.
+
+### Container Orchestration (ECS Fargate)
+While YellowPad uses Kubernetes, I built equivalent orchestration on **AWS ECS Fargate** — the concepts translate directly:
+
+| ECS Concept | Kubernetes Equivalent |
+|-------------|----------------------|
+| Task Definition | Pod Spec |
+| ECS Service | Deployment + ReplicaSet |
+| Cloud Map service discovery | CoreDNS + ClusterIP Service |
+| ALB target groups | Ingress + Service |
+| IAM task roles | ServiceAccount + RBAC |
+| CloudWatch container insights | Prometheus node-exporter |
+| ECS capacity providers | Node pools / affinity rules |
+| Private subnet isolation | NetworkPolicy |
+
+Each ECS service is deployed across private subnets, with health checks, auto-scaling, private DNS-based service discovery, and IAM roles scoped per service.
+
+### Networking (VPC, Security Groups, TLS, DNS)
+Designed and implemented a **3-tier VPC architecture** (`10.1.0.0/16`):
+
+- **Tier 1 (Public):** ALB + WAF, accepts 80/443, redirects HTTP → HTTPS
+- **Tier 2 (Private):** ECS Fargate services, accessible only from ALB on service ports
+- **Tier 3 (Database):** Aurora PostgreSQL cluster, accessible only from Tier 2 + Bastion on port 5432
+- **Security Groups:** Least-privilege ingress rules between tiers, no direct internet access from private/database tiers
+- **TLS:** ACM wildcard certificate (`*.compass.wayfindr.io`) with automated Route53 DNS validation
+- **DNS:** Route53 hosted zone for `compass.wayfindr.io`, A records aliased to ALB
+
+### Secrets Management (AWS Secrets Manager + SSM)
+Implemented a dual-layer secrets architecture:
+
+- **AWS Secrets Manager:** Sensitive credentials (DB master password, app user passwords, service API keys) with automatic rotation
+- **AWS Systems Manager Parameter Store:** Non-sensitive config (endpoints, ARNs) under namespace `/{app_name}/{environment}/...`
+- **ECS integration:** Secrets injected as environment variables from Secrets Manager ARNs in task definitions — containers never touch raw credentials directly
+- **Bastion operations:** Python script (`bastion_tunnel.py`) fetches SSM ARNs to resolve Secrets Manager values for manual operational tasks
+
+### PostgreSQL Administration
+Built full Aurora PostgreSQL v17 Serverless v2 infrastructure including:
+
+- Serverless v2 scaling (0.5–1 ACU), auto-pause, 7-day backup retention
+- Schema design for multi-tenant rate card management (20+ tables)
+- Alembic migration pipeline with remote execution via bastion SSM tunnel
+- Separate master user (Secrets Manager rotation) and application user (least-privilege)
+- PostgreSQL also powers **LangGraph agent checkpoints** for stateful multi-agent workflows in the MA Layer service
+- Local dev → staging → production migration workflow via `make db-upgrade-*` targets
+
+### CI/CD Pipeline Design
+While the platform uses Makefile-based pipelines (not a hosted CI service), the release workflow is fully scripted and repeatable:
+
+```bash
+make release-staging-image   # builds multi-stage Docker image → pushes to ECR
+make deploy-staging          # terraform apply on staging ECS stack
+make db-upgrade-staging      # runs Alembic migrations via bastion tunnel
+make restart-staging-services # force-deploys new task revisions
+```
+
+Each service follows identical patterns, supporting independent deployment cadences. Infrastructure plan/apply separation (`make plan-*` vs `make deploy-*`) mirrors PR-based CI gate patterns.
+
+### Linux & Scripting (Bash + Python)
+Operational automation written in both:
+
+- **Bash:** `release-service-image.sh`, `update-m2m-secrets.sh`, `get-image-uri.sh`, `get_db_master_password.sh`, `prepare-build.sh`
+- **Python:** `bastion_tunnel.py` — full SSM Session Manager port-forwarding script with boto3, typed with `typing.List` for Python 3.8+ compatibility, reads Terraform outputs + SSM parameters dynamically
+
+---
+
+## Highly Valued Skills — Direct Evidence
+
+### Secrets Management (Vault-comparable pattern)
+AWS Secrets Manager with automatic rotation covers the same security surface as HashiCorp Vault for this deployment. SSM Parameter Store handles configuration. The pattern is architecturally equivalent to Vault's static/dynamic secrets model.
+
+### Object Storage (S3-compatible)
+Designed and provisioned S3 buckets for tenant file storage (rate cards, exports):
+
+- Server-side AES256 encryption
+- CORS configuration for browser-direct uploads
+- All public access blocks enabled
+- Terraform-managed bucket policies
+
+MinIO is the on-prem equivalent — the interface is identical (S3 API compatible).
+
+### Managed Database Alternatives (PostgreSQL HA)
+Aurora Serverless v2 provides automatic failover and HA. The Terraform module is designed to be replaceable — the application layer only sees `DB_HOST`, `DB_PORT`, `DB_NAME`. Swapping Aurora for CloudNativePG or Patroni requires only changing the module, not the service code.
+
+### Security (Container hardening, Network segmentation)
+- Multi-stage builds eliminate build toolchain from production images
+- Non-root execution via Uvicorn process (no `--user root` in Dockerfiles)
+- **WAF** with SQL injection, XSS, bot control, geo-blocking, and rate limiting rules (AWS Managed Rules + custom)
+- VPC Flow Logs enabled for network audit trail
+- All inter-service traffic stays within private VPC (no public endpoints for ECS tasks)
+- IAM roles follow least-privilege (separate execution role vs task role)
+
+---
+
+## Nice to Have — Direct Evidence
+
+### Monitoring Stack
+CloudWatch-based observability covering:
+
+- **Application logs:** Structured JSON via `structlog` library, X-Request-ID correlation across services
+- **Dashboards:** CloudWatch dashboard with ALB (request rates, error rates), WAF (blocked/allowed), ECS (CPU/memory)
+- **Log groups:** Segmented per service and environment: `/aws/ecs/{app_name}/{env}/{service_name}`
+- **VPC Flow Logs:** Network-level audit at 3-day retention
+- **LLM observability:** LangSmith integration in MA Layer for agent trace visibility
+
+This maps directly to YellowPad's Loki + Grafana stack — the observability concerns are identical; the backends are swappable.
+
+### Auth Alternatives
+AWS Cognito provides equivalent capability to Firebase Auth + Okta SAML:
+
+- **JWT validation:** RS256 (Cognito production) + HS256 (local dev) via `compass-auth` strategy pattern
+- **M2M authentication:** Cognito app clients with OAuth2 client credentials flow for service-to-service auth
+- **SAML integration:** Cognito supports SAML identity providers (maps to Keycloak's SAML/OIDC support)
+
+### API Gateway Pattern
+ALB implements API gateway concerns without a dedicated gateway service:
+
+- Path-based routing (`/v1/business/*`, `/v1/integration/*`, `/v1/ma-layer/*`)
+- HTTPS termination + HTTP redirect
+- WAF integration
+- Health check routing
+- Access logging
+
+---
+
+## GCP Stack Mapping (YellowPad Migration Context)
+
+YellowPad's goal is migrating off GCP. I built the AWS equivalents from scratch — the patterns are directly transferable:
+
+| YellowPad GCP | AWS Equivalent I Built | On-Prem Equivalent |
+|---------------|------------------------|-------------------|
+| Cloud Run | ECS Fargate | Kubernetes (Deployment + Service) |
+| AlloyDB (PostgreSQL + pgvector) | Aurora PostgreSQL | CloudNativePG / Patroni + pgvector |
+| Memorystore (Redis) | (planned) | Redis standalone/Sentinel |
+| Pub/Sub | (EventBridge planned) | NATS / RabbitMQ / Redis Streams |
+| Secret Manager | AWS Secrets Manager | HashiCorp Vault |
+| Cloud Storage | S3 | MinIO |
+| Artifact Registry | ECR | Harbor / Nexus |
+| Cloud Build | Makefile-based release pipeline | GitHub Actions / GitLab CI |
+| Firebase Auth | Cognito | Keycloak |
+| Cloud Logging | CloudWatch Logs | Loki |
+| Cloud Monitoring | CloudWatch Metrics + Dashboards | Prometheus + Grafana |
+
+Building this platform taught me **why** each managed service exists and what it takes to replace it — which is exactly the mindset needed for on-prem migration work.
+
+---
+
+## Architecture Overview
+
+```
+Internet
+    │
+    ▼
+Route53 (compass.wayfindr.io)
+    │
+    ▼
+ALB (HTTPS/443) ──── WAF (SQLi, XSS, rate limit, geo-block)
+    │
+    ├── /v1/business/*   →  Business Logic Service (ECS, port 4000)
+    ├── /v1/integration/* →  Integration Service   (ECS, port 5001)
+    └── /v1/ma-layer/*   →  MA Layer Service       (ECS, port 7000)
+                                    │
+                        Private VPC (10.1.0.0/16)
+                                    │
+                ┌───────────────────┼───────────────────┐
+                ▼                   ▼                   ▼
+         Aurora PostgreSQL      S3 (files)         Cognito (auth)
+         (private subnet)    (rate cards,         (JWT + M2M)
+         - 20+ tables          exports)
+         - LangGraph
+           checkpoints
+                │
+        Secrets Manager     SSM Parameter Store
+        (credentials)       (config / ARNs)
+                │
+    CloudWatch Logs + Metrics + VPC Flow Logs
+```
+
+---
+
+## Summary
+
+I designed and built Compass PaaS end-to-end: IaC, networking, container orchestration, database, secrets, CI/CD, observability, and shared platform libraries. Every component was built with production concerns in mind — security hardening, least-privilege IAM, encrypted storage, WAF, and structured logging.
+
+The on-prem migration challenge YellowPad describes — replacing managed cloud services with portable, self-hosted equivalents — is conceptually the same work I've already done in reverse: I built the replaceable architecture. I understand the seams between services and how to swap managed dependencies without changing application code.

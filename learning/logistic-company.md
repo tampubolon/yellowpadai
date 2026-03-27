@@ -659,12 +659,12 @@ Kubernetes Cluster
 │   └── nodes: standard CPU instances, no GPU
 │
 ├── gpu-training-pool    (batch training jobs, ephemeral)
-│   ├── nodes: high-memory GPU instances (e.g. A100 / H100)
+│   ├── nodes: p4d.24xlarge (8× NVIDIA A100 40GB) or p5.48xlarge (8× NVIDIA H100 80GB)
 │   ├── taint: nvidia.com/gpu=training:NoSchedule
 │   └── auto-scales to 0 when no training job is running
 │
 └── gpu-inference-pool   (always-on model serving)
-    ├── nodes: mid-tier GPU instances (e.g. L4 / A10G)
+    ├── nodes: g6.2xlarge (1× NVIDIA L4 24GB) or g5.2xlarge (1× NVIDIA A10G 24GB)
     ├── taint: nvidia.com/gpu=inference:NoSchedule
     └── min replicas: 1, HPA scales on request queue depth
 ```

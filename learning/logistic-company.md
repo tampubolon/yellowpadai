@@ -647,203 +647,638 @@ The on-prem migration challenge YellowPad describes — replacing managed cloud 
 
 Currently the MA Layer service delegates all LLM inference to external APIs (OpenAI, Anthropic, etc.). The future goal is to run a **self-hosted LLM** — eliminating external API costs, removing data egress concerns, and giving full control over the model weights. This requires two distinct pipelines: a **training pipeline** (fine-tune the base model on domain data) and an **inference pipeline** (serve the trained model to the MA Layer at runtime).
 
-Both pipelines share the same Kubernetes cluster but use dedicated **GPU node pools** with taints/tolerations to ensure GPU workloads never land on CPU nodes and vice versa.
+Both pipelines share the same EKS cluster but use dedicated **GPU node groups** with taints/tolerations to ensure GPU workloads never land on CPU nodes and vice versa.
 
 ---
 
 ### Node Pool Design
 
 ```
-Kubernetes Cluster
-├── cpu-node-pool        (general workloads: BLS, Integration, MA Layer app logic)
-│   └── nodes: standard CPU instances, no GPU
+EKS Cluster
+├── cpu-node-group           (general workloads: BLS, Integration, MA Layer app logic)
+│   ├── instance: m7i.2xlarge (8 vCPU, 32 GB RAM)
+│   └── no GPU, no taint
 │
-├── gpu-training-pool    (batch training jobs, ephemeral)
-│   ├── nodes: p4d.24xlarge (8× NVIDIA A100 40GB) or p5.48xlarge (8× NVIDIA H100 80GB)
+├── gpu-training-node-group  (batch fine-tuning jobs, ephemeral)
+│   ├── instance: p4d.24xlarge (8× NVIDIA A100 40GB, NVLink)
+│   │            or p5.48xlarge (8× NVIDIA H100 80GB, NVLink + EFA)
+│   ├── AMI: Amazon EKS-optimized Accelerated AMI (al2-nvidia)
+│   ├── label: node-role=gpu-training
 │   ├── taint: nvidia.com/gpu=training:NoSchedule
-│   └── auto-scales to 0 when no training job is running
+│   └── Cluster Autoscaler: min=0, max=4 nodes (scale to 0 when idle)
 │
-└── gpu-inference-pool   (always-on model serving)
-    ├── nodes: g6.2xlarge (1× NVIDIA L4 24GB) or g5.2xlarge (1× NVIDIA A10G 24GB)
+└── gpu-inference-node-group (always-on model serving)
+    ├── instance: g6.2xlarge  (1× NVIDIA L4 24GB)   — preferred for inference
+    │            or g5.2xlarge (1× NVIDIA A10G 24GB) — alternative
+    ├── AMI: Amazon EKS-optimized Accelerated AMI (al2-nvidia)
+    ├── label: node-role=gpu-inference
     ├── taint: nvidia.com/gpu=inference:NoSchedule
-    └── min replicas: 1, HPA scales on request queue depth
+    └── Cluster Autoscaler: min=1, max=10 nodes (KEDA-driven scale-out)
+```
+
+---
+
+### Step 1 — GPU Node Group Setup
+
+Before any workload runs, the cluster needs three one-time setup steps: provisioning the node groups, installing the NVIDIA device plugin, and verifying GPU visibility.
+
+#### 1a. Provision EKS GPU Node Groups (Terraform)
+
+```hcl
+# infra/modules/eks/gpu_node_groups.tf
+
+resource "aws_eks_node_group" "gpu_training" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "gpu-training"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = var.private_subnet_ids
+
+  ami_type       = "AL2_x86_64_GPU"          # EKS-optimized NVIDIA AMI
+  instance_types = ["p4d.24xlarge"]
+  capacity_type  = "ON_DEMAND"
+
+  scaling_config {
+    desired_size = 0
+    min_size     = 0
+    max_size     = 4
+  }
+
+  taint {
+    key    = "nvidia.com/gpu"
+    value  = "training"
+    effect = "NO_SCHEDULE"
+  }
+
+  labels = {
+    "node-role" = "gpu-training"
+  }
+}
+
+resource "aws_eks_node_group" "gpu_inference" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "gpu-inference"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = var.private_subnet_ids
+
+  ami_type       = "AL2_x86_64_GPU"
+  instance_types = ["g6.2xlarge"]
+  capacity_type  = "ON_DEMAND"
+
+  scaling_config {
+    desired_size = 1
+    min_size     = 1
+    max_size     = 10
+  }
+
+  taint {
+    key    = "nvidia.com/gpu"
+    value  = "inference"
+    effect = "NO_SCHEDULE"
+  }
+
+  labels = {
+    "node-role" = "gpu-inference"
+  }
+}
+```
+
+#### 1b. Install NVIDIA Device Plugin (DaemonSet)
+
+The NVIDIA device plugin exposes each GPU on a node as an allocatable resource (`nvidia.com/gpu: 1`) so the Kubernetes scheduler can assign GPU pods correctly. Without it, pods request GPUs but the scheduler has no awareness of them.
+
+```bash
+# Install via Helm — runs as DaemonSet on every GPU node
+helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
+helm repo update
+
+helm upgrade --install nvidia-device-plugin nvdp/nvidia-device-plugin \
+  --namespace kube-system \
+  --set failOnInitError=false
+```
+
+The DaemonSet uses a `nodeSelector` targeting nodes with NVIDIA drivers already installed (provided by the AL2 GPU AMI). It mounts the host's NVIDIA runtime socket and registers each physical GPU as a schedulable resource.
+
+```
+GPU Node (p4d.24xlarge)
+├── Host OS: Amazon Linux 2 + NVIDIA driver 535.x (baked into AL2 GPU AMI)
+├── Container runtime: containerd + nvidia-container-toolkit
+└── DaemonSet pod: nvidia-device-plugin
+    └── registers: nvidia.com/gpu = 8  (advertised to kube-apiserver)
+```
+
+#### 1c. Verify GPU Availability
+
+```bash
+# Check allocatable GPUs per node
+kubectl get nodes -l node-role=gpu-training \
+  -o custom-columns="NODE:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu"
+
+# Run a smoke-test pod to confirm CUDA is functional
+kubectl run gpu-test --image=nvidia/cuda:12.2.0-base-ubuntu22.04 \
+  --restart=Never --rm -it \
+  --overrides='{"spec":{"tolerations":[{"key":"nvidia.com/gpu","value":"training","effect":"NoSchedule"}],"nodeSelector":{"node-role":"gpu-training"},"containers":[{"name":"gpu-test","image":"nvidia/cuda:12.2.0-base-ubuntu22.04","command":["nvidia-smi"],"resources":{"limits":{"nvidia.com/gpu":"1"}}}]}}' \
+  -- nvidia-smi
+# Expected: GPU model, driver version, CUDA version printed
 ```
 
 ---
 
 ### Pipeline 1 — LLM Training
 
-The training pipeline fine-tunes a base model (e.g. Mistral 7B, LLaMA 3) on domain-specific data: rate cards, logistics documents, and historical chat logs extracted from Compass PaaS.
+The training pipeline fine-tunes a base model (e.g. Mistral 7B, LLaMA 3 8B) on domain-specific data: rate cards, logistics documents, and historical chat logs extracted from Compass PaaS.
+
+#### Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  DATA PREPARATION                                                           │
-│                                                                             │
-│  Compass PostgreSQL          S3 (raw files)         Manual curation        │
-│  (rate cards, chat logs)     (PDFs, Excel)          (instruction pairs)    │
-│         │                        │                        │                │
-│         └────────────────────────┴────────────────────────┘                │
-│                                  │                                          │
-│                                  ▼                                          │
-│              ┌───────────────────────────────────┐                         │
-│              │  Preprocessing Job (CPU node pool) │                         │
-│              │  • clean + deduplicate text        │                         │
-│              │  • tokenize (HuggingFace tokenizer)│                         │
-│              │  • format: instruction/response    │                         │
-│              │    pairs for supervised fine-tune  │                         │
-│              │  • split: train / eval / test      │                         │
-│              └─────────────────┬─────────────────┘                         │
-│                                │                                            │
-│                                ▼                                            │
-│                   S3 / MinIO — dataset bucket                               │
-│                   train.jsonl  eval.jsonl  test.jsonl                       │
-└────────────────────────────────┬────────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  TRAINING JOB (gpu-training-pool)                                           │
-│                                                                             │
-│  Kubeflow PyTorchJob (distributed, if multi-GPU)                            │
-│  tolerations: nvidia.com/gpu=training                                       │
-│  resources: nvidia.com/gpu: 4                                               │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  Training Container                                                  │  │
-│  │  • pull base model weights from HuggingFace Hub (or S3 cache)       │  │
-│  │  • load dataset from S3                                              │  │
-│  │  • fine-tune with QLoRA / LoRA (PEFT) — memory-efficient            │  │
-│  │  • validation loop every N steps → logs metrics to MLflow           │  │
-│  │  • checkpoint adapter weights → S3 every epoch                      │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-│                                 │                                           │
-│                                 ▼                                           │
-│  MLflow Tracking Server (CPU node pool)                                     │
-│  • records: loss, perplexity, eval scores per epoch                        │
-│  • stores: hyperparameters, run metadata                                   │
-│  • artifact store backed by S3                                             │
-└────────────────────────────────┬────────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  EVALUATION & PROMOTION                                                     │
-│                                                                             │
-│  ┌────────────────────────────┐      ┌──────────────────────────────────┐  │
-│  │  Eval Job (CPU node pool)  │      │  Model Registry (MLflow)         │  │
-│  │  • run test set benchmarks │ ───▶ │  • tag run as "staging"          │  │
-│  │  • domain-specific evals   │      │  • human review / A/B gate       │  │
-│  │    (rate card extraction   │      │  • promote to "production" tag   │  │
-│  │     accuracy, hallucination│      │    on approval                   │  │
-│  │     rate)                  │      └──────────────────────────────────┘  │
-│  └────────────────────────────┘                                             │
-│                                                                             │
-│  Artifacts stored in S3:                                                    │
-│  s3://models/compass-llm/{version}/adapter_weights/                        │
-│  s3://models/compass-llm/{version}/merged_model/   (optional full merge)   │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STAGE 1 — DATA INGESTION & PREPROCESSING  (cpu-node-group)                 │
+│                                                                              │
+│  Source A: Compass PostgreSQL                                                │
+│  ┌───────────────────────────────────┐                                       │
+│  │  Kubernetes CronJob               │                                       │
+│  │  image: compass-data-exporter     │                                       │
+│  │  • SELECT rate_cards, chat_logs   │                                       │
+│  │    WHERE created_at > last_run    │                                       │
+│  │  • serialize to JSONL             │                                       │
+│  │  • upload → s3://datasets/raw/    │                                       │
+│  └───────────────┬───────────────────┘                                       │
+│                  │                                                            │
+│  Source B: S3 raw files (PDFs, Excel rate sheets)                            │
+│  ┌───────────────────────────────────┐                                       │
+│  │  Kubernetes Job                   │                                       │
+│  │  image: unstructured-io/unstructured                                      │
+│  │  • PDF → text (pdfminer)          │                                       │
+│  │  • Excel → structured rows        │                                       │
+│  │  • upload → s3://datasets/raw/    │                                       │
+│  └───────────────┬───────────────────┘                                       │
+│                  │                                                            │
+│  Source C: Manual instruction pairs (Google Sheets / CSV)                    │
+│  • curated Q&A examples for rate card interpretation                         │
+│  • uploaded directly to s3://datasets/raw/                                   │
+│                  │                                                            │
+│                  ▼                                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐   │
+│  │  Preprocessing Job  (HuggingFace datasets + pandas)                   │   │
+│  │                                                                       │   │
+│  │  1. load_dataset("json", data_files="s3://datasets/raw/*.jsonl")      │   │
+│  │  2. deduplicate by content hash                                       │   │
+│  │  3. apply chat template:                                              │   │
+│  │       {"role":"user",    "content": "What is the rate for..."}        │   │
+│  │       {"role":"assistant","content": "The rate card shows..."}        │   │
+│  │  4. tokenize with AutoTokenizer (max_length=4096, truncation=True)    │   │
+│  │  5. train/eval/test split (90/5/5)                                    │   │
+│  │  6. save_to_disk → s3://datasets/processed/{run_id}/                 │   │
+│  └───────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STAGE 2 — DISTRIBUTED FINE-TUNING  (gpu-training-node-group)               │
+│                                                                              │
+│  Kubeflow PyTorchJob — 1 master + 3 workers (4 nodes × p4d.24xlarge)        │
+│  Each node: 8× A100 40GB → 32 GPUs total                                    │
+│  Inter-node: EFA (Elastic Fabric Adapter) for high-bandwidth NCCL           │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Master Pod (rank 0)                Worker Pods (rank 1–3)          │    │
+│  │  ┌──────────────────────┐           ┌──────────────────────┐        │    │
+│  │  │ torchrun --nproc 8   │  ◀──────▶ │ torchrun --nproc 8   │        │    │
+│  │  │ train.py             │  NCCL/EFA │ train.py (replica)   │        │    │
+│  │  └──────────────────────┘           └──────────────────────┘        │    │
+│  │                                                                     │    │
+│  │  Training script (train.py) — PEFT + QLoRA:                        │    │
+│  │                                                                     │    │
+│  │  model = AutoModelForCausalLM.from_pretrained(                     │    │
+│  │      "mistralai/Mistral-7B-v0.3",                                  │    │
+│  │      quantization_config=BitsAndBytesConfig(                       │    │
+│  │          load_in_4bit=True,                                        │    │
+│  │          bnb_4bit_quant_type="nf4",                                │    │
+│  │          bnb_4bit_use_double_quant=True,                           │    │
+│  │          bnb_4bit_compute_dtype=torch.bfloat16,                   │    │
+│  │      ),                                                            │    │
+│  │  )                                                                 │    │
+│  │  model = get_peft_model(model, LoraConfig(                         │    │
+│  │      r=64, lora_alpha=128,                                         │    │
+│  │      target_modules=["q_proj","k_proj","v_proj","o_proj"],         │    │
+│  │      lora_dropout=0.05, bias="none",                               │    │
+│  │      task_type="CAUSAL_LM",                                        │    │
+│  │  ))                                                                │    │
+│  │                                                                     │    │
+│  │  Trainer = SFTTrainer(                                              │    │
+│  │      model, dataset, peft_config,                                  │    │
+│  │      max_seq_length=4096,                                          │    │
+│  │      per_device_train_batch_size=4,                                │    │
+│  │      gradient_accumulation_steps=8,   # effective batch = 32×GPUs  │    │
+│  │      fp16=False, bf16=True,                                        │    │
+│  │      num_train_epochs=3,                                           │    │
+│  │      save_strategy="epoch",                                        │    │
+│  │      report_to="mlflow",                                           │    │
+│  │  )                                                                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Checkpoints saved every epoch:                                              │
+│  s3://models/compass-llm/{run_id}/epoch-{n}/adapter_model.safetensors       │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  │  metrics streamed every step
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  MLflow Tracking Server  (cpu-node-group, StatefulSet + PostgreSQL backend) │
+│                                                                              │
+│  Records per run:                                                            │
+│  • train/loss, eval/loss, eval/perplexity  (every epoch)                   │
+│  • learning_rate, gradient_norm             (every step)                    │
+│  • GPU memory utilization                   (every 100 steps)               │
+│  • hyperparameters: r, lora_alpha, lr, batch_size, epochs                  │
+│  • artifact path: s3://models/compass-llm/{run_id}/                        │
+│                                                                              │
+│  Web UI accessible via kubectl port-forward for run comparison              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STAGE 3 — EVALUATION & MODEL PROMOTION  (cpu-node-group)                   │
+│                                                                              │
+│  ┌─────────────────────────────────┐    ┌───────────────────────────────┐   │
+│  │  Eval Kubernetes Job            │    │  MLflow Model Registry        │   │
+│  │                                 │    │                               │   │
+│  │  lm-evaluation-harness:         │    │  run tagged "candidate"       │   │
+│  │  • rate card extraction F1      │───▶│  human reviews MLflow UI      │   │
+│  │  • hallucination rate           │    │  approves → tag "production"  │   │
+│  │  • instruction-following score  │    │                               │   │
+│  │  • ROUGE on held-out summaries  │    │  s3://models/compass-llm/     │   │
+│  │                                 │    │    production/ → symlink      │   │
+│  │  outputs: eval_results.json     │    │    to winning run_id          │   │
+│  │  → logged as MLflow artifact    │    └───────────────────────────────┘   │
+│  └─────────────────────────────────┘                                         │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key tools:** PyTorch + HuggingFace Transformers, PEFT (LoRA/QLoRA), Kubeflow Training Operator, MLflow, S3/MinIO for artifact storage.
+#### PyTorchJob Manifest
+
+```yaml
+# k8s/training/pytorch-job.yaml
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: compass-llm-finetune
+  namespace: ml-training
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          tolerations:
+            - key: nvidia.com/gpu
+              value: training
+              effect: NoSchedule
+          nodeSelector:
+            node-role: gpu-training
+          initContainers:
+            - name: pull-dataset
+              image: amazon/aws-cli:latest
+              command:
+                - aws
+                - s3
+                - sync
+                - s3://datasets/processed/$(DATASET_RUN_ID)/
+                - /data/dataset/
+              volumeMounts:
+                - name: dataset
+                  mountPath: /data/dataset
+          containers:
+            - name: pytorch
+              image: 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/compass-trainer:latest
+              command:
+                - torchrun
+                - --nproc_per_node=8
+                - --nnodes=4
+                - --node_rank=$(RANK)
+                - --master_addr=$(MASTER_ADDR)
+                - --master_port=23456
+                - train.py
+                - --model_name=mistralai/Mistral-7B-v0.3
+                - --dataset_path=/data/dataset
+                - --output_dir=/data/output
+                - --num_epochs=3
+                - --lora_r=64
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  memory: 1Ti
+              env:
+                - name: MLFLOW_TRACKING_URI
+                  value: http://mlflow.ml-platform.svc:5000
+                - name: HF_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hf-credentials
+                      key: token
+              volumeMounts:
+                - name: dataset
+                  mountPath: /data/dataset
+                - name: output
+                  mountPath: /data/output
+          volumes:
+            - name: dataset
+              emptyDir: {}
+            - name: output
+              emptyDir: {}
+    Worker:
+      replicas: 3
+      restartPolicy: OnFailure
+      template:
+        spec:
+          tolerations:
+            - key: nvidia.com/gpu
+              value: training
+              effect: NoSchedule
+          nodeSelector:
+            node-role: gpu-training
+          containers:
+            - name: pytorch
+              image: 123456789.dkr.ecr.ap-southeast-1.amazonaws.com/compass-trainer:latest
+              resources:
+                limits:
+                  nvidia.com/gpu: "8"
+                  memory: 1Ti
+```
+
+**Key tools:** Kubeflow Training Operator, PyTorch + HuggingFace Transformers, PEFT (LoRA/QLoRA), bitsandbytes (4-bit quantization), TRL SFTTrainer, lm-evaluation-harness, MLflow, S3 for artifact storage.
 
 ---
 
 ### Pipeline 2 — LLM Inference
 
-Once a model version is promoted to `production` in the registry, the inference pipeline loads it and serves it as an OpenAI-compatible API endpoint — so the MA Layer service requires only a config change (swap `OPENAI_BASE_URL`) with zero code changes.
+Once a model version is tagged `production` in MLflow, Argo CD picks up the change and rolls out the updated vLLM Deployment onto the inference node group. The MA Layer service needs only an environment variable change — no code changes.
+
+#### Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  MODEL LOADING                                                              │
-│                                                                             │
-│  MLflow Model Registry                                                      │
-│  (production tag)                                                           │
-│         │                                                                   │
-│         │  on new production tag → trigger Argo CD sync                    │
-│         ▼                                                                   │
-│  Argo CD reconciles inference Deployment                                    │
-│  → updates MODEL_VERSION env var in vLLM pod spec                          │
-│  → rolling restart of inference pods                                        │
-│         │                                                                   │
-│         ▼                                                                   │
-│  vLLM Pod init container                                                    │
-│  • pulls adapter weights from S3                                            │
-│  • merges LoRA adapter into base model (or loads separately)               │
-│  • model ready — main container starts                                      │
-└────────────────────────────────┬────────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  INFERENCE SERVING (gpu-inference-pool)                                     │
-│                                                                             │
-│  Kubernetes Deployment                                                      │
-│  tolerations: nvidia.com/gpu=inference                                      │
-│  resources: nvidia.com/gpu: 1                                               │
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  vLLM Server                                                         │  │
-│  │  • OpenAI-compatible REST API (/v1/chat/completions)                 │  │
-│  │  • continuous batching — maximizes GPU utilization                   │  │
-│  │  • PagedAttention — efficient KV-cache management                    │  │
-│  │  • tensor parallelism if multi-GPU per node                         │  │
-│  │  • port 8000 exposed as ClusterIP Service                            │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-│  HPA (Horizontal Pod Autoscaler)                                            │
-│  • metric: pending request queue depth (KEDA + Prometheus adapter)         │
-│  • min: 1 replica, max: N replicas                                          │
-│  • scale-up fast (30s), scale-down slow (5m) — avoid cold starts           │
-└────────────────────────────────┬────────────────────────────────────────────┘
-                                 │  ClusterIP (internal only)
-                                 │  http://vllm-service:8000
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  MA LAYER SERVICE (cpu-node-pool)                                           │
-│                                                                             │
-│  No code change required — only config change:                              │
-│                                                                             │
-│  Before (external API):                                                     │
-│    OPENAI_BASE_URL=https://api.openai.com/v1                                │
-│    OPENAI_API_KEY=sk-...                                                    │
-│                                                                             │
-│  After (self-hosted):                                                       │
-│    OPENAI_BASE_URL=http://vllm-service:8000/v1                              │
-│    OPENAI_API_KEY=ignored   (vLLM accepts any value)                        │
-│                                                                             │
-│  LangGraph state machine → LLM calls → vLLM → GPU inference → response     │
-│  LangSmith still traces token usage, latency, tool calls as before         │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  TRIGGER — Model Promotion                                                   │
+│                                                                              │
+│  MLflow Model Registry                                                       │
+│  • human approves eval results in MLflow UI                                 │
+│  • tags run as "production"                                                  │
+│  • webhook fires → updates Git repo:                                         │
+│      k8s/inference/kustomization.yaml                                        │
+│      MODEL_RUN_ID: abc123  →  MODEL_RUN_ID: def456                          │
+│                                                                              │
+│  Argo CD (watching inference/ directory in Git)                              │
+│  • detects diff in kustomization.yaml                                        │
+│  • applies updated Deployment to cluster                                     │
+│  • triggers rolling restart of vLLM pods                                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STAGE 1 — MODEL LOADING  (gpu-inference-node-group)                        │
+│                                                                              │
+│  vLLM Pod — init container runs before main container starts:               │
+│                                                                              │
+│  initContainer: model-downloader                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  1. aws s3 sync                                                      │   │
+│  │       s3://models/compass-llm/production/adapter_weights/            │   │
+│  │       /model-cache/adapter/                                          │   │
+│  │                                                                      │   │
+│  │  2. merge LoRA adapter into base model weights:                      │   │
+│  │       python merge_adapter.py \                                      │   │
+│  │         --base mistralai/Mistral-7B-v0.3 \                          │   │
+│  │         --adapter /model-cache/adapter/ \                            │   │
+│  │         --output /model-cache/merged/                                │   │
+│  │       (saves merged SafeTensors → shared emptyDir volume)            │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Shared volume /model-cache/ passed to main container                       │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STAGE 2 — SERVING  (gpu-inference-node-group)                              │
+│                                                                              │
+│  Kubernetes Deployment: vllm-server                                          │
+│  node: g6.2xlarge (1× NVIDIA L4 24GB) per pod                              │
+│  taint toleration: nvidia.com/gpu=inference                                 │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  vLLM Server (main container)                                        │   │
+│  │                                                                      │   │
+│  │  python -m vllm.entrypoints.openai.api_server \                     │   │
+│  │    --model /model-cache/merged/ \                                    │   │
+│  │    --served-model-name compass-llm \                                 │   │
+│  │    --dtype bfloat16 \                                                │   │
+│  │    --max-model-len 4096 \                                            │   │
+│  │    --gpu-memory-utilization 0.90 \                                   │   │
+│  │    --max-num-seqs 256 \           # max concurrent requests          │   │
+│  │    --enable-chunked-prefill \     # long-context efficiency          │   │
+│  │    --port 8000                                                       │   │
+│  │                                                                      │   │
+│  │  Exposes:                                                            │   │
+│  │  GET  /health              → liveness probe                          │   │
+│  │  GET  /v1/models           → list loaded models                      │   │
+│  │  POST /v1/chat/completions → OpenAI-compatible inference             │   │
+│  │  GET  /metrics             → Prometheus metrics (port 8001)          │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Key vLLM internals active on L4:                                           │
+│  • PagedAttention  — KV cache in pages, no memory fragmentation             │
+│  • Continuous batching — new requests join in-flight batches                │
+│  • CUDA graphs — captures static compute graph, reduces kernel launch cost  │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                  │
+                 ┌────────────────┴────────────────┐
+                 │  ClusterIP Service: vllm-service  │
+                 │  port 8000 (inference)            │
+                 │  port 8001 (metrics)              │
+                 └────────────────┬────────────────┘
+                                  │
+          ┌───────────────────────┼───────────────────────┐
+          ▼                       ▼                       ▼
+┌──────────────────┐   ┌──────────────────┐   ┌──────────────────────────┐
+│  MA Layer        │   │  Prometheus       │   │  KEDA ScaledObject       │
+│  Service         │   │  (scrapes :8001)  │   │                          │
+│                  │   │  metrics:         │   │  trigger:                │
+│  OPENAI_BASE_URL │   │  • vllm_requests  │   │  • vllm_num_requests_    │
+│  =http://vllm-   │   │    _running       │   │    waiting (Prometheus)  │
+│  service:8000/v1 │   │  • vllm_gpu_      │   │  • threshold: 5 pending  │
+│                  │   │    cache_usage    │   │  • minReplicas: 1        │
+│  LangGraph calls │   │  • vllm_e2e_      │   │  • maxReplicas: 10       │
+│  /v1/chat/       │   │    request_latency│   │  • scaleDown: 5m cool-   │
+│  completions     │   │    _seconds       │   │    down (avoid flapping) │
+└──────────────────┘   └──────────────────┘   └──────────────────────────┘
 ```
 
-**Key tools:** vLLM (inference server), KEDA (event-driven autoscaling), Argo CD (GitOps deployment), Prometheus (metrics).
+#### vLLM Deployment Manifest
+
+```yaml
+# k8s/inference/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server
+  namespace: ml-inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-server
+  template:
+    metadata:
+      labels:
+        app: vllm-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8001"
+        prometheus.io/path:   "/metrics"
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          value: inference
+          effect: NoSchedule
+      nodeSelector:
+        node-role: gpu-inference
+      initContainers:
+        - name: model-downloader
+          image: amazon/aws-cli:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              aws s3 sync s3://models/compass-llm/production/adapter_weights/ \
+                /model-cache/adapter/ --no-progress
+              python /scripts/merge_adapter.py \
+                --base mistralai/Mistral-7B-v0.3 \
+                --adapter /model-cache/adapter/ \
+                --output /model-cache/merged/
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.5.5
+          command:
+            - python
+            - -m
+            - vllm.entrypoints.openai.api_server
+          args:
+            - --model=/model-cache/merged/
+            - --served-model-name=compass-llm
+            - --dtype=bfloat16
+            - --max-model-len=4096
+            - --gpu-memory-utilization=0.90
+            - --max-num-seqs=256
+            - --enable-chunked-prefill
+            - --port=8000
+          ports:
+            - containerPort: 8000   # inference
+            - containerPort: 8001   # prometheus metrics
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: 22Gi
+            requests:
+              memory: 20Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120   # model load time
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 30
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+      volumes:
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 20Gi
+```
+
+#### KEDA ScaledObject (queue-depth autoscaling)
+
+```yaml
+# k8s/inference/scaledobject.yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-scaledobject
+  namespace: ml-inference
+spec:
+  scaleTargetRef:
+    name: vllm-server
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 300           # 5 min scale-down cooldown — avoid flapping
+  pollingInterval: 15
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        metricName: vllm_num_requests_waiting
+        query: sum(vllm_num_requests_waiting{namespace="ml-inference"})
+        threshold: "5"          # scale out when > 5 requests queued per replica
+```
+
+**Key tools:** vLLM (inference server + OpenAI-compatible API), KEDA (event-driven HPA), Argo CD (GitOps model rollout), Prometheus + Grafana (GPU metrics dashboard), AWS Cluster Autoscaler (node-level scale-out).
 
 ---
 
 ### End-to-End Flow Summary
 
 ```
-[New training data]
-        │
-        ▼
-Preprocessing Job ──▶ S3 dataset
-        │
-        ▼
-PyTorchJob (GPU training pool)
-        │
-        ├──▶ MLflow (metrics, checkpoints)
-        │
-        ▼
-Eval Job ──▶ pass/fail gate
-        │
-        ▼
-MLflow: promote to "production"
-        │
-        ▼
-Argo CD detects new model version
-        │
-        ▼
-vLLM Deployment rolling update (GPU inference pool)
-        │
-        ▼
-MA Layer service — zero code change, queries internal endpoint
+[New domain data available]
+         │
+         ▼
+CronJob: export Compass DB + S3 raw files → s3://datasets/raw/
+         │
+         ▼
+Preprocessing Job (cpu-node-group)
+  HuggingFace datasets: clean, tokenize, format, split
+  → s3://datasets/processed/{run_id}/
+         │
+         ▼
+Kubeflow PyTorchJob (gpu-training-node-group, p4d.24xlarge)
+  torchrun (4 nodes × 8 GPUs = 32× A100)
+  SFTTrainer + QLoRA/PEFT → adapter_model.safetensors
+  → s3://models/compass-llm/{run_id}/
+  → MLflow: loss, perplexity logged every epoch
+         │
+         ▼
+Eval Job (cpu-node-group)
+  lm-evaluation-harness → domain benchmarks
+  → results logged to MLflow
+         │
+         ├── FAIL: run discarded, retrain with adjusted hyperparams
+         │
+         └── PASS: MLflow tags run "production"
+                   webhook updates Git kustomization.yaml
+                   │
+                   ▼
+         Argo CD detects Git diff
+         → rolling update: vLLM Deployment (gpu-inference-node-group)
+           init container: s3 sync → merge adapter → /model-cache/merged/
+           vLLM loads merged model, readiness probe passes
+           old pods drained, new pods serve traffic
+                   │
+                   ▼
+         MA Layer Service (cpu-node-group)
+         OPENAI_BASE_URL=http://vllm-service:8000/v1
+         LangGraph → /v1/chat/completions → vLLM → L4 GPU
+         LangSmith traces: token usage, latency, tool calls
+                   │
+                   ▼
+         KEDA: vllm_num_requests_waiting > 5
+         → Cluster Autoscaler adds g6.2xlarge nodes
+         → new vLLM pods scheduled, init container pulls model
 ```
 
 ---
@@ -852,9 +1287,11 @@ MA Layer service — zero code change, queries internal endpoint
 
 | Concern | Decision | Reason |
 |---------|----------|--------|
-| Fine-tune vs train from scratch | Fine-tune (LoRA/QLoRA) | Fraction of GPU cost, same quality for domain adaptation |
-| vLLM as inference server | OpenAI-compatible API | MA Layer needs zero code changes; continuous batching maximizes throughput |
-| Separate training vs inference node pools | Different GPU tiers + taints | Training needs high-memory GPUs (A100) briefly; inference needs always-on mid-tier (L4/A10G) |
-| KEDA for HPA | Queue-depth metric | Standard CPU/memory HPA is blind to inference backpressure |
-| Argo CD for model rollout | GitOps | Model version is config, not code — same rollout/rollback discipline applies |
-| LoRA adapters stored separately | S3 versioned objects | Swap model versions without re-downloading the full base model (~7B params) |
+| Fine-tune vs train from scratch | QLoRA fine-tune (PEFT) | 4-bit quantization fits 7B model on A100; fraction of full-precision training cost |
+| Distributed training across nodes | Kubeflow PyTorchJob + torchrun + EFA | NCCL over EFA achieves near-linear scaling on p4d; avoids bottleneck at rank 0 |
+| vLLM as inference server | OpenAI-compatible REST API | MA Layer zero code change; continuous batching + PagedAttention maximize L4 throughput |
+| Separate training vs inference node pools | Different instance types + taints | p4d.24xlarge for burst training (scale to 0); g6.2xlarge for always-on serving (cost-efficient) |
+| KEDA over standard HPA | Queue-depth metric from Prometheus | CPU/memory HPA is blind to inference backpressure; pending request count is the true saturation signal |
+| Argo CD for model rollout | GitOps: model version in kustomization.yaml | Same rollout/rollback discipline as application code; full audit trail in Git |
+| LoRA adapter stored separately from base model | S3 versioned objects | Base model (~14 GB) downloaded once and cached; only 200–500 MB adapter swapped per version |
+| AL2 GPU AMI | EKS-optimized Accelerated AMI | NVIDIA drivers + nvidia-container-toolkit pre-baked; no driver bootstrap on node startup |
